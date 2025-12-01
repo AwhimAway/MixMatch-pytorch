@@ -34,18 +34,58 @@ def train_val_split(labels, n_labeled_per_class):
     train_labeled_idxs = []
     train_unlabeled_idxs = []
     val_idxs = []
-
+    
+    print("You are now using an IMBALANCED dataset!")
+    cls = 10 #number of classes in the dataset
+    total = n_labeled_per_class * cls
+    weights = np.random.dirichlet([2]*cls)
+    parts = (weights * total).astype(int)
+    diff = total - parts.sum()
+    for _ in range(diff):
+        parts[np.random.randint(0, cls)] += 1
+        
+    # indices of parts correspond to the number of labeled samples per class
+    print(parts)
+    
+    #for each class do
     for i in range(10):
+        #find the labels that correspond to the class
         idxs = np.where(labels == i)[0]
+        
+        # print("ID = ", idxs[:parts[i]])
+        
+        #shuffle the labels 
         np.random.shuffle(idxs)
-        train_labeled_idxs.extend(idxs[:n_labeled_per_class])
-        train_unlabeled_idxs.extend(idxs[n_labeled_per_class:-500])
+        train_labeled_idxs.extend(idxs[:parts[i]])
+        print(f"Number of Labeled for Class {i}: {len(idxs[:parts[i]])} ")
+        
+        train_unlabeled_idxs.extend(idxs[parts[i]:-500])
+        print(f"Number of Unlabeled for Class {i}: {len(train_unlabeled_idxs)} ")
+        
         val_idxs.extend(idxs[-500:])
     np.random.shuffle(train_labeled_idxs)
     np.random.shuffle(train_unlabeled_idxs)
     np.random.shuffle(val_idxs)
 
     return train_labeled_idxs, train_unlabeled_idxs, val_idxs
+
+# def train_val_split(labels, n_labeled_per_class):
+#     labels = np.array(labels)
+#     train_labeled_idxs = []
+#     train_unlabeled_idxs = []
+#     val_idxs = []
+
+#     for i in range(10):
+#         idxs = np.where(labels == i)[0]
+#         np.random.shuffle(idxs)
+#         train_labeled_idxs.extend(idxs[:n_labeled_per_class])
+#         train_unlabeled_idxs.extend(idxs[n_labeled_per_class:-500])
+#         val_idxs.extend(idxs[-500:])
+#     np.random.shuffle(train_labeled_idxs)
+#     np.random.shuffle(train_unlabeled_idxs)
+#     np.random.shuffle(val_idxs)
+
+#     return train_labeled_idxs, train_unlabeled_idxs, val_idxs
 
 cifar10_mean = (0.4914, 0.4822, 0.4465) # equals np.mean(train_set.train_data, axis=(0,1,2))/255
 cifar10_std = (0.2471, 0.2435, 0.2616) # equals np.std(train_set.train_data, axis=(0,1,2))/255

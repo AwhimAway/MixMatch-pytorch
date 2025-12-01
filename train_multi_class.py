@@ -18,13 +18,14 @@ import torchvision.transforms as transforms
 import torch.nn.functional as F
 
 import models.wideresnet as models
+# import models.resnet18 as models
 import dataset.cifar10 as dataset
 from utils import Bar, Logger, AverageMeter, accuracy, mkdir_p, savefig
 from tensorboardX import SummaryWriter
 
 parser = argparse.ArgumentParser(description='PyTorch MixMatch Training')
 # Optimization options
-parser.add_argument('--epochs', default=1024, type=int, metavar='N',
+parser.add_argument('--epochs', default=512, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -92,7 +93,7 @@ def main():
     test_loader = data.DataLoader(test_set, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     # Model
-    print("==> creating WRN-28-2")
+    print("==> creating WideResNet-28-2")
 
     def create_model(ema=False):
         model = models.WideResNet(num_classes=10)
@@ -144,9 +145,9 @@ def main():
         print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
 
         train_loss, train_loss_x, train_loss_u = train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_optimizer, train_criterion, epoch, use_cuda)
-        _, train_acc = validate(labeled_trainloader, ema_model, criterion, epoch, use_cuda, mode='Train Stats')
-        val_loss, val_acc = validate(val_loader, ema_model, criterion, epoch, use_cuda, mode='Valid Stats')
-        test_loss, test_acc = validate(test_loader, ema_model, criterion, epoch, use_cuda, mode='Test Stats ')
+        _, train_acc, perClcAcc = validate(labeled_trainloader, ema_model, criterion, epoch, use_cuda, mode='Train Stats')
+        val_loss, val_acc, perClcAcc = validate(val_loader, ema_model, criterion, epoch, use_cuda, mode='Valid Stats')
+        test_loss, test_acc, perClcAcc = validate(test_loader, ema_model, criterion, epoch, use_cuda, mode='Test Stats ')
 
         step = args.train_iteration * (epoch + 1)
 
@@ -200,16 +201,16 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
     model.train()
     for batch_idx in range(args.train_iteration):
         try:
-            inputs_x, targets_x = labeled_train_iter.next()
+            inputs_x, targets_x = next(labeled_train_iter)
         except:
             labeled_train_iter = iter(labeled_trainloader)
-            inputs_x, targets_x = labeled_train_iter.next()
+            inputs_x, targets_x = next(labeled_train_iter)
 
         try:
-            (inputs_u, inputs_u2), _ = unlabeled_train_iter.next()
+            (inputs_u, inputs_u2), _ = next(unlabeled_train_iter)
         except:
             unlabeled_train_iter = iter(unlabeled_trainloader)
-            (inputs_u, inputs_u2), _ = unlabeled_train_iter.next()
+            (inputs_u, inputs_u2), _ = next(unlabeled_train_iter)
 
         # measure data loading time
         data_time.update(time.time() - end)
@@ -301,13 +302,52 @@ def train(labeled_trainloader, unlabeled_trainloader, model, optimizer, ema_opti
 
     return (losses.avg, losses_x.avg, losses_u.avg,)
 
-def validate(valloader, model, criterion, epoch, use_cuda, mode):
+def per_class_accuracy(outputs, targets, num_classes=10):
+    """
+    Compute per-class correct and total counts, return per-class accuracies as a numpy array.
+    outputs: model raw outputs (logits), shape (N, C)
+    targets: ground-truth labels, shape (N,)
+    """
+    with torch.no_grad():
+        preds = outputs.argmax(dim=1)  # shape (N,)
+        # ensure CPU tensors for counting to avoid repeated GPU->CPU transfers
+        preds_cpu = preds.detach().cpu().long()
+        targets_cpu = targets.detach().cpu().long()
 
+        correct_counts = np.zeros(num_classes, dtype=np.int64)
+        total_counts = np.zeros(num_classes, dtype=np.int64)
+
+        for c in range(num_classes):
+            mask = (targets_cpu == c)
+            total = int(mask.sum().item()) if hasattr(mask, 'sum') else int(mask.sum())
+            if total == 0:
+                correct = 0
+            else:
+                correct = int((preds_cpu[mask] == c).sum().item())
+            correct_counts[c] += correct
+            total_counts[c] += total
+
+        # Avoid division by zero; return 0.0 for classes with zero total
+        per_class_acc = np.zeros(num_classes, dtype=np.float32)
+        for c in range(num_classes):
+            if total_counts[c] > 0:
+                per_class_acc[c] = correct_counts[c] / total_counts[c]
+            else:
+                per_class_acc[c] = 0.0
+
+        return per_class_acc, correct_counts, total_counts
+    
+def validate(valloader, model, criterion, epoch, use_cuda, mode):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
     top1 = AverageMeter()
     top5 = AverageMeter()
+
+    # For accumulating per-class counts across all batches
+    num_classes = 10
+    accum_correct = np.zeros(num_classes, dtype=np.int64)
+    accum_total = np.zeros(num_classes, dtype=np.int64)
 
     # switch to evaluate mode
     model.eval()
@@ -327,9 +367,15 @@ def validate(valloader, model, criterion, epoch, use_cuda, mode):
 
             # measure accuracy and record loss
             prec1, prec5 = accuracy(outputs, targets, topk=(1, 5))
+            # accumulate
             losses.update(loss.item(), inputs.size(0))
             top1.update(prec1.item(), inputs.size(0))
             top5.update(prec5.item(), inputs.size(0))
+
+            # per-class update for this batch
+            per_cls_acc_batch, correct_counts_batch, total_counts_batch = per_class_accuracy(outputs, targets, num_classes=num_classes)
+            accum_correct += correct_counts_batch
+            accum_total += total_counts_batch
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -349,7 +395,72 @@ def validate(valloader, model, criterion, epoch, use_cuda, mode):
                         )
             bar.next()
         bar.finish()
-    return (losses.avg, top1.avg)
+
+    # compute final per-class accuracies
+    per_class_acc = np.zeros(num_classes, dtype=np.float32)
+    for c in range(num_classes):
+        if accum_total[c] > 0:
+            per_class_acc[c] = accum_correct[c] / accum_total[c]
+        else:
+            per_class_acc[c] = 0.0
+
+    # print a compact per-class report
+    print(f'\n{mode} per-class accuracy (class: acc% (correct/total)):')
+    for c in range(num_classes):
+        print(f'  {c:2d}: {per_class_acc[c]*100:5.2f}% ({accum_correct[c]}/{accum_total[c]})')
+
+    return (losses.avg, top1.avg, per_class_acc)
+
+# def validate(valloader, model, criterion, epoch, use_cuda, mode):
+
+#     batch_time = AverageMeter()
+#     data_time = AverageMeter()
+#     losses = AverageMeter()
+#     top1 = AverageMeter()
+#     top5 = AverageMeter()
+
+#     # switch to evaluate mode
+#     model.eval()
+
+#     end = time.time()
+#     bar = Bar(f'{mode}', max=len(valloader))
+#     with torch.no_grad():
+#         for batch_idx, (inputs, targets) in enumerate(valloader):
+#             # measure data loading time
+#             data_time.update(time.time() - end)
+
+#             if use_cuda:
+#                 inputs, targets = inputs.cuda(), targets.cuda(non_blocking=True)
+#             # compute output
+#             outputs = model(inputs)
+#             loss = criterion(outputs, targets)
+
+#             # measure accuracy and record loss
+#             prec1, prec5 = accuracy(outputs, targets, topk=(1, 5))
+#             print(prec1)
+#             losses.update(loss.item(), inputs.size(0))
+#             top1.update(prec1.item(), inputs.size(0))
+#             top5.update(prec5.item(), inputs.size(0))
+
+#             # measure elapsed time
+#             batch_time.update(time.time() - end)
+#             end = time.time()
+
+#             # plot progress
+#             bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} | top1: {top1: .4f} | top5: {top5: .4f}'.format(
+#                         batch=batch_idx + 1,
+#                         size=len(valloader),
+#                         data=data_time.avg,
+#                         bt=batch_time.avg,
+#                         total=bar.elapsed_td,
+#                         eta=bar.eta_td,
+#                         loss=losses.avg,
+#                         top1=top1.avg,
+#                         top5=top5.avg,
+#                         )
+#             bar.next()
+#         bar.finish()
+#     return (losses.avg, top1.avg)
 
 def save_checkpoint(state, is_best, checkpoint=args.out, filename='checkpoint.pth.tar'):
     filepath = os.path.join(checkpoint, filename)
